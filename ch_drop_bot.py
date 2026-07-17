@@ -8,80 +8,229 @@ product is a link like:
 with a "$255" price and an "OUT OF STOCK" label when sold out.
 
 What this does:
-  - Every CHECK_INTERVAL seconds it loads each category page in STORE_URLS.
-  - It builds the set of products currently listed and whether each is in stock.
-  - It diffs against what it saw last time (saved in seen.json).
+  - Every CHECK_INTERVAL seconds (plus jitter) it loads each watched category
+    page, building the set of products currently listed and whether each is in
+    stock. Categories are discovered from the site's top nav, with a configured
+    fallback list.
+  - It diffs against what it saw last time (saved in a configurable seen.json).
   - It pings you on Telegram when a NEW product appears or a sold-out one
-    comes back in stock.
+    comes back in stock. Alerts are batched and throttled.
+
+The site sits behind Akamai bot protection, so the fetch layer tries plain
+`requests` first and transparently falls back to a headless Playwright browser
+when it hits a 403 / JS challenge / empty parse. Strategy is configurable:
+auto (default) | requests | playwright.
 
 First run just records what's there (no spam). Alerts start next cycle.
 
 Setup:
-  pip install requests beautifulsoup4
-  Fill in BOT_TOKEN and CHAT_ID (see notes at the bottom), then:
+  pip install -r requirements.txt
+  cp .env.example .env   # then fill in BOT_TOKEN and CHAT_ID
   python ch_drop_bot.py
 """
 
+import logging
+import logging.handlers
+import os
 import json
 import random
 import re
 import time
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
+load_dotenv()  # pull BOT_TOKEN / CHAT_ID / tunables from a local .env if present
+
+log = logging.getLogger("ch_drop_bot")
+
 
 # ------------------------- CONFIG -------------------------
-BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN"        # from @BotFather
-CHAT_ID = "PASTE_YOUR_CHAT_ID"            # your numeric Telegram id
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
 
-# Chrome Hearts is category-based (no single "all products" page), so list every
-# category you want watched. Add/remove freely.
-STORE_URLS = [
-    "https://www.chromehearts.com/socks",
-    # "https://www.chromehearts.com/scents",
-    # "https://www.chromehearts.com/baccarat",
-    # "https://www.chromehearts.com/boxers-leggings",
-]
 
-CHECK_INTERVAL = 120                     # seconds between full sweeps (keep >=60)
-JITTER = 30                              # random 0..JITTER extra seconds per sweep
+def _env_list(name: str, default: list[str]) -> list[str]:
+    raw = os.getenv(name)
+    if not raw:
+        return list(default)
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+BASE = "https://www.chromehearts.com"
+
+# Secrets — never hardcode these; they come from the environment / .env.
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHAT_ID = os.getenv("CHAT_ID", "")
+
+# Fetch strategy: auto | requests | playwright
+FETCH_STRATEGY = os.getenv("FETCH_STRATEGY", "auto").strip().lower()
+
+# Chrome Hearts is category-based (no single "all products" page). We try to
+# discover categories from the top nav each sweep; this is the fallback list
+# used when discovery fails or is disabled.
+STORE_URLS = _env_list(
+    "STORE_URLS",
+    [
+        f"{BASE}/socks",
+        f"{BASE}/scents",
+        f"{BASE}/baccarat",
+        f"{BASE}/boxers-leggings",
+        f"{BASE}/intimates",
+    ],
+)
+
+# Scrape the nav for categories automatically (catches new categories).
+DISCOVER_CATEGORIES = os.getenv("DISCOVER_CATEGORIES", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+CHECK_INTERVAL = _env_int("CHECK_INTERVAL", 120)   # base seconds between sweeps
+JITTER = _env_int("JITTER", 30)                    # random 0..JITTER extra sec/sweep
+PER_URL_DELAY = _env_int("PER_URL_DELAY", 3)       # politeness pause between pages
+MAX_FETCH_RETRIES = _env_int("MAX_FETCH_RETRIES", 4)  # per-URL retry attempts
+BACKOFF_BASE = _env_int("BACKOFF_BASE", 2)         # exponential backoff base (sec)
 
 # Optional: only alert when a title contains one of these (case-insensitive).
-# Leave [] to be alerted about every new product.
-KEYWORDS = []                            # e.g. ["ring", "hoodie"]
+KEYWORDS = _env_list("KEYWORDS", [])
 
-STATE_FILE = Path("seen.json")
-BASE = "https://www.chromehearts.com"
+STATE_FILE = Path(os.getenv("STATE_FILE", "seen.json"))
+LOG_FILE = os.getenv("LOG_FILE", "ch_drop_bot.log")
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
+        "image/webp,*/*;q=0.8"
+    ),
 }
 
 # A product detail URL is /<category>/<handle>/<id>.html  (three path segments).
 # This deliberately excludes /socks (category) and /terms.html (one segment).
 PRODUCT_RE = re.compile(r"^/[^/]+/[^/]+/[^/]+\.html$")
 PRICE_RE = re.compile(r"^\$\s?\d")
+
+# Telegram rate limits: ~30 msgs/sec globally but ~1 msg/sec to a single chat.
+TELEGRAM_MAX_ITEMS_PER_MSG = _env_int("TELEGRAM_MAX_ITEMS_PER_MSG", 10)
+TELEGRAM_SEND_DELAY = float(os.getenv("TELEGRAM_SEND_DELAY", "1.2"))
+TELEGRAM_MAX_MSG_CHARS = 3800  # stay under Telegram's 4096 hard limit
+
+# Markers that indicate an Akamai / JS bot-challenge interstitial rather than a
+# real category page.
+CHALLENGE_MARKERS = (
+    "access denied",
+    "reference #",
+    "akamai",
+    "enable javascript",
+    "please verify you are a human",
+    "bot detection",
+    "_incapsula_",
+    "challenge-platform",
+)
 # ----------------------------------------------------------
 
 
-def send_telegram(text: str) -> None:
+def setup_logging() -> None:
+    """stdout + rotating file, structured with timestamps and levels."""
+    if log.handlers:  # already configured (e.g. re-entrant / tests)
+        return
+    log.setLevel(logging.INFO)
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S"
+    )
+
+    stream = logging.StreamHandler()
+    stream.setFormatter(fmt)
+    log.addHandler(stream)
+
+    if LOG_FILE:
+        try:
+            fileh = logging.handlers.RotatingFileHandler(
+                LOG_FILE, maxBytes=2_000_000, backupCount=5, encoding="utf-8"
+            )
+            fileh.setFormatter(fmt)
+            log.addHandler(fileh)
+        except OSError as e:
+            log.warning("Could not open log file %s: %s", LOG_FILE, e)
+
+
+# ------------------------- TELEGRAM -------------------------
+def _post_telegram(text: str) -> bool:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
         r = requests.post(
             url,
-            data={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
+            data={
+                "chat_id": CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": "false",
+            },
             timeout=20,
         )
         if not r.ok:
-            print("Telegram error:", r.status_code, r.text)
+            log.error("Telegram error: %s %s", r.status_code, r.text)
+            return False
+        return True
     except requests.RequestException as e:
-        print("Telegram request failed:", e)
+        log.error("Telegram request failed: %s", e)
+        return False
 
 
+def send_telegram(text: str) -> bool:
+    """Send a single message (kept for simple/manual use and tests)."""
+    return _post_telegram(text)
+
+
+def format_hit(url: str, prod: dict, kind: str) -> str:
+    """One product's alert block: title, price, direct URL, NEW vs RESTOCK."""
+    tag = "🆕" if kind == "NEW" else "🔁"
+    price = f" — {prod['price']}" if prod.get("price") else ""
+    title = prod.get("title") or url.rsplit("/", 1)[-1]
+    return f"{tag} <b>{kind}</b>: {title}{price}\n{url}"
+
+
+def _chunk_hits(hits: list[tuple]) -> list[str]:
+    """Group hit blocks into Telegram-sized messages (batching)."""
+    messages: list[str] = []
+    current: list[str] = []
+    length = 0
+    header = "🔔 <b>Chrome Hearts</b>\n\n"
+    for url, prod, kind in hits:
+        block = format_hit(url, prod, kind)
+        block_len = len(block) + 2
+        too_many = len(current) >= TELEGRAM_MAX_ITEMS_PER_MSG
+        too_long = length + block_len + len(header) > TELEGRAM_MAX_MSG_CHARS
+        if current and (too_many or too_long):
+            messages.append(header + "\n\n".join(current))
+            current, length = [], 0
+        current.append(block)
+        length += block_len
+    if current:
+        messages.append(header + "\n\n".join(current))
+    return messages
+
+
+def send_batch(hits: list[tuple]) -> None:
+    """Batch hits into as few messages as possible and throttle sends."""
+    messages = _chunk_hits(hits)
+    for i, msg in enumerate(messages):
+        _post_telegram(msg)
+        if i + 1 < len(messages):
+            time.sleep(TELEGRAM_SEND_DELAY)
+
+
+# ------------------------- PARSING -------------------------
 def parse_products(html: str) -> dict:
     """
     Turn a category page into {product_url: {title, price, available}}.
@@ -130,23 +279,182 @@ def parse_products(html: str) -> dict:
     return products
 
 
-def get_current_products() -> dict:
-    """Sweep every configured category page into one combined dict."""
-    combined = {}
-    for url in STORE_URLS:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=25)
-            r.raise_for_status()
-        except requests.RequestException as e:
-            print(f"Fetch failed for {url} (retry next sweep):", e)
+def discover_categories(html: str) -> list[str]:
+    """
+    Enumerate category URLs from a homepage's top nav.
+
+    Category links are single-segment paths (e.g. /socks, /scents) — not product
+    detail pages (three segments, .html) and not deep utility pages. Returns
+    absolute URLs, de-duplicated, order preserved.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    seen: dict[str, None] = {}
+    skip = {
+        "account", "login", "cart", "search", "wishlist", "checkout",
+        "customer-service", "stores", "legal", "privacy", "terms",
+        "gift-cards", "gift-card", "sitemap",
+    }
+    for a in soup.find_all("a", href=True):
+        href = a["href"].split("?")[0].split("#")[0]
+        abs_url = urljoin(BASE + "/", href)
+        parsed = urlparse(abs_url)
+        if parsed.netloc and parsed.netloc not in urlparse(BASE).netloc:
             continue
-        found = parse_products(r.text)
+        segments = [s for s in parsed.path.split("/") if s]
+        if len(segments) != 1:
+            continue
+        slug = segments[0]
+        if slug.endswith(".html") or slug in skip:
+            continue
+        category_url = f"{BASE}/{slug}"
+        seen.setdefault(category_url, None)
+    return list(seen)
+
+
+# ------------------------- FETCH LAYER -------------------------
+def looks_like_challenge(status: int | None, html: str) -> bool:
+    """
+    True when a response is a block/challenge rather than a real page.
+
+    Pure decision helper (no I/O) so the fallback logic is unit-testable:
+      - HTTP 403 / 429 / 503 are hard blocks.
+      - A short body containing a known bot-challenge marker is a soft block.
+    """
+    if status in (403, 429, 503):
+        return True
+    if not html or not html.strip():
+        return True
+    low = html.lower()
+    if any(marker in low for marker in CHALLENGE_MARKERS):
+        # Genuine pages can mention these words in passing; only treat a small
+        # interstitial (no real product markup) as a challenge.
+        if len(html) < 40_000:
+            return True
+    return False
+
+
+def fetch_via_requests(url: str, session: requests.Session | None = None):
+    """Return (status_code, text). status_code is None on a transport error."""
+    sess = session or requests
+    try:
+        r = sess.get(url, headers=HEADERS, timeout=25)
+        return r.status_code, r.text
+    except requests.RequestException as e:
+        log.warning("requests fetch error for %s: %s", url, e)
+        return None, ""
+
+
+def fetch_via_playwright(url: str, timeout_ms: int = 30_000) -> str:
+    """Render the page in headless Chromium and return its HTML."""
+    from playwright.sync_api import sync_playwright  # lazy: optional dependency
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            context = browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                locale="en-US",
+            )
+            page = context.new_page()
+            page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)  # let client-side product tiles render
+            return page.content()
+        finally:
+            browser.close()
+
+
+def fetch_html(url: str, strategy: str = None, session=None) -> str | None:
+    """
+    Fetch a category page's HTML using the configured strategy.
+
+      requests   -> only plain requests
+      playwright -> only headless browser
+      auto       -> requests first; fall back to playwright on a challenge,
+                    a transport error, or an empty parse.
+
+    Returns HTML, or None if nothing usable could be fetched.
+    """
+    strategy = (strategy or FETCH_STRATEGY or "auto").lower()
+
+    if strategy == "playwright":
+        try:
+            return fetch_via_playwright(url)
+        except Exception as e:  # noqa: BLE001 - playwright surfaces many types
+            log.error("Playwright fetch failed for %s: %s", url, e)
+            return None
+
+    status, html = fetch_via_requests(url, session=session)
+
+    if strategy == "requests":
+        return html or None
+
+    # auto: decide whether requests is good enough or we must escalate.
+    blocked = looks_like_challenge(status, html)
+    empty = (not blocked) and (not parse_products(html))
+    if blocked or empty:
+        reason = "challenge/block" if blocked else "empty parse"
+        log.info("requests %s for %s (status=%s) — falling back to Playwright",
+                 reason, url, status)
+        try:
+            return fetch_via_playwright(url)
+        except Exception as e:  # noqa: BLE001
+            log.error("Playwright fallback failed for %s: %s", url, e)
+            return html or None
+    return html
+
+
+def fetch_with_backoff(url: str, session=None) -> str | None:
+    """Fetch one URL with exponential backoff across transient failures."""
+    for attempt in range(1, MAX_FETCH_RETRIES + 1):
+        html = fetch_html(url, session=session)
+        if html and parse_products(html):
+            return html
+        if html and FETCH_STRATEGY == "requests":
+            # requests-only mode: trust the (possibly empty) result, no browser.
+            return html
+        if attempt < MAX_FETCH_RETRIES:
+            delay = BACKOFF_BASE ** attempt + random.uniform(0, 1)
+            log.warning("Fetch attempt %d/%d for %s yielded nothing; retrying in %.1fs",
+                        attempt, MAX_FETCH_RETRIES, url, delay)
+            time.sleep(delay)
+    log.error("Giving up on %s after %d attempts", url, MAX_FETCH_RETRIES)
+    return None
+
+
+def watched_categories(session=None) -> list[str]:
+    """Discover categories from the nav; fall back to the configured list."""
+    if not DISCOVER_CATEGORIES:
+        return list(STORE_URLS)
+    home = fetch_html(BASE, session=session)
+    if home:
+        found = discover_categories(home)
+        if found:
+            # Union with configured URLs so a nav miss never drops a category.
+            merged = list(dict.fromkeys(found + list(STORE_URLS)))
+            log.info("Discovered %d categories from nav (%d configured fallback)",
+                     len(found), len(STORE_URLS))
+            return merged
+    log.warning("Category discovery failed; using configured STORE_URLS")
+    return list(STORE_URLS)
+
+
+def get_current_products(session=None) -> dict:
+    """Sweep every watched category page into one combined dict."""
+    combined = {}
+    urls = watched_categories(session=session)
+    for url in urls:
+        html = fetch_with_backoff(url, session=session)
+        if not html:
+            continue
+        found = parse_products(html)
         if not found:
-            print(f"  0 products parsed from {url} — markup may have changed.")
+            log.info("0 products parsed from %s — markup may have changed.", url)
         combined.update(found)
+        time.sleep(PER_URL_DELAY + random.uniform(0, 1))  # politeness
     return combined
 
 
+# ------------------------- STATE -------------------------
 def load_seen() -> dict:
     return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
 
@@ -159,9 +467,11 @@ def passes_keywords(title: str) -> bool:
     return not KEYWORDS or any(k.lower() in title.lower() for k in KEYWORDS)
 
 
-def check_once(seen: dict) -> dict:
-    current = get_current_products()
+# ------------------------- CORE LOOP -------------------------
+def check_once(seen: dict, session=None) -> dict:
+    current = get_current_products(session=session)
     if not current:
+        log.warning("No products fetched this sweep; keeping previous state.")
         return seen
 
     first_run = len(seen) == 0
@@ -177,27 +487,36 @@ def check_once(seen: dict) -> dict:
     save_seen(seen)
 
     if first_run:
-        print(f"Seeded {len(current)} products. Watching for changes...")
+        log.info("Seeded %d products. Watching for changes...", len(current))
         return seen
 
-    for url, prod, kind in hits:
-        price = f" — {prod['price']}" if prod.get("price") else ""
-        send_telegram(f"🔔 <b>Chrome Hearts {kind}</b>\n{prod['title']}{price}\n{url}")
-        print("Alerted:", kind, prod["title"])
-
-    if not hits:
-        print(f"No changes ({len(current)} products live).")
+    if hits:
+        send_batch(hits)
+        for url, prod, kind in hits:
+            log.info("Alerted: %s %s", kind, prod["title"])
+    else:
+        log.info("No changes (%d products live).", len(current))
     return seen
 
 
 def main():
-    if "PASTE_YOUR" in BOT_TOKEN or "PASTE_YOUR" in CHAT_ID:
-        raise SystemExit("Set BOT_TOKEN and CHAT_ID first.")
+    setup_logging()
+    if not BOT_TOKEN or not CHAT_ID:
+        raise SystemExit(
+            "Set BOT_TOKEN and CHAT_ID (env or .env). See .env.example."
+        )
+    session = requests.Session()
     seen = load_seen()
-    print("Monitor started.")
+    log.info("Monitor started (strategy=%s, discover=%s, state=%s).",
+             FETCH_STRATEGY, DISCOVER_CATEGORIES, STATE_FILE)
     while True:
-        seen = check_once(seen)
-        time.sleep(CHECK_INTERVAL + random.uniform(0, JITTER))
+        try:
+            seen = check_once(seen, session=session)
+        except Exception as e:  # noqa: BLE001 - never let one bad sweep kill the loop
+            log.exception("Sweep failed: %s", e)
+        sleep_for = CHECK_INTERVAL + random.uniform(0, JITTER)
+        log.info("Sleeping %.0fs until next sweep.", sleep_for)
+        time.sleep(sleep_for)
 
 
 if __name__ == "__main__":
