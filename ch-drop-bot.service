@@ -1,0 +1,35 @@
+# systemd unit for the Chrome Hearts drop monitor.
+#
+# Install:
+#   sudo cp ch-drop-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ch-drop-bot
+# Logs:
+#   journalctl -u ch-drop-bot -f
+#
+# Adjust User, WorkingDirectory, and the venv path below to your host.
+
+[Unit]
+Description=Chrome Hearts drop monitor -> Telegram alerts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chdrop
+WorkingDirectory=/opt/ChromeDrop
+# Secrets live in this file (chmod 600), not in the unit.
+EnvironmentFile=/opt/ChromeDrop/.env
+ExecStart=/opt/ChromeDrop/.venv/bin/python /opt/ChromeDrop/ch_drop_bot.py
+Restart=always
+RestartSec=15
+# Keep the state file across restarts; write logs under the working dir.
+StateDirectory=ch-drop-bot
+
+# Light hardening.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
