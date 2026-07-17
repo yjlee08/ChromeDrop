@@ -329,6 +329,35 @@ def test_chunk_hits_batches_many_into_few_messages(monkeypatch):
         assert f"Item {i}" in joined
 
 
+def test_first_run_retries_empty_categories(monkeypatch):
+    """On first run, a category that starts empty is retried after a cooldown."""
+    monkeypatch.setattr(ch_drop_bot, "watched_categories",
+                        lambda session=None: [f"{BASE}/socks", f"{BASE}/scents"])
+    monkeypatch.setattr(ch_drop_bot.time, "sleep", lambda s: None)
+    monkeypatch.setattr(ch_drop_bot, "PER_URL_DELAY", 0)
+
+    calls = {f"{BASE}/scents": 0}
+
+    def fake_backoff(url, session=None):
+        if url == f"{BASE}/socks":
+            return CATEGORY_HTML  # parses to 3 socks
+        calls[url] += 1
+        # scents: empty the first time, populated on the cooldown retry.
+        return "" if calls[url] == 1 else CATEGORY_HTML
+
+    monkeypatch.setattr(ch_drop_bot, "fetch_with_backoff", fake_backoff)
+
+    # first_run=False: scents stays empty (no retry)
+    prods_no_retry = ch_drop_bot.get_current_products(first_run=False)
+    assert calls[f"{BASE}/scents"] == 1
+
+    calls[f"{BASE}/scents"] = 0
+    # first_run=True: scents empty -> retried -> recovered
+    prods_retry = ch_drop_bot.get_current_products(first_run=True)
+    assert calls[f"{BASE}/scents"] == 2
+    assert len(prods_retry) >= 3
+
+
 def test_send_batch_throttles(monkeypatch):
     posted = []
     sleeps = []

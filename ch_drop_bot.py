@@ -97,6 +97,7 @@ JITTER = _env_int("JITTER", 30)                    # random 0..JITTER extra sec/
 PER_URL_DELAY = _env_int("PER_URL_DELAY", 3)       # politeness pause between pages
 MAX_FETCH_RETRIES = _env_int("MAX_FETCH_RETRIES", 4)  # per-URL retry attempts
 BACKOFF_BASE = _env_int("BACKOFF_BASE", 2)         # exponential backoff base (sec)
+SEED_RETRY_COOLDOWN = _env_int("SEED_RETRY_COOLDOWN", 25)  # first-run empty-retry wait
 
 # Optional: only alert when a title contains one of these (case-insensitive).
 KEYWORDS = _env_list("KEYWORDS", [])
@@ -463,19 +464,44 @@ def watched_categories(session=None) -> list[str]:
     return list(STORE_URLS)
 
 
-def get_current_products(session=None) -> dict:
-    """Sweep every watched category page into one combined dict."""
+def get_current_products(session=None, first_run=False) -> dict:
+    """
+    Sweep every watched category page into one combined dict.
+
+    On the very first run we seed silently, so a category that gets throttled
+    to an empty result MUST be recovered — otherwise its whole existing catalog
+    would later surface as false "NEW" alerts. So on first run, empty categories
+    are retried after a cooldown that lets Akamai's rate limit clear.
+    """
     combined = {}
     urls = watched_categories(session=session)
+    # Shuffle order each sweep so no single category is perpetually fetched last
+    # (and thus perpetually starved by cumulative Akamai throttling).
+    random.shuffle(urls)
+
+    empty_urls = []
     for url in urls:
         html = fetch_with_backoff(url, session=session)
-        if not html:
-            continue
-        found = parse_products(html)
+        found = parse_products(html) if html else {}
         if not found:
-            log.info("0 products parsed from %s — markup may have changed.", url)
+            log.info("0 products parsed from %s.", url)
+            empty_urls.append(url)
         combined.update(found)
         time.sleep(PER_URL_DELAY + random.uniform(0, 1))  # politeness
+
+    if first_run and empty_urls:
+        for url in empty_urls:
+            log.info("Seed run: cooling down %ds then retrying empty %s",
+                     SEED_RETRY_COOLDOWN, url)
+            time.sleep(SEED_RETRY_COOLDOWN)
+            html = fetch_with_backoff(url, session=session)
+            found = parse_products(html) if html else {}
+            if found:
+                log.info("Seed retry recovered %d products from %s", len(found), url)
+                combined.update(found)
+            else:
+                log.warning("Seed retry still empty for %s (will seed on a later "
+                            "sweep once reachable).", url)
     return combined
 
 
@@ -494,12 +520,12 @@ def passes_keywords(title: str) -> bool:
 
 # ------------------------- CORE LOOP -------------------------
 def check_once(seen: dict, session=None) -> dict:
-    current = get_current_products(session=session)
+    first_run = len(seen) == 0
+    current = get_current_products(session=session, first_run=first_run)
     if not current:
         log.warning("No products fetched this sweep; keeping previous state.")
         return seen
 
-    first_run = len(seen) == 0
     hits = []
     for url, prod in current.items():
         was = seen.get(url)
