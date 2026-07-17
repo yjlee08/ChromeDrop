@@ -97,7 +97,6 @@ JITTER = _env_int("JITTER", 30)                    # random 0..JITTER extra sec/
 PER_URL_DELAY = _env_int("PER_URL_DELAY", 3)       # politeness pause between pages
 MAX_FETCH_RETRIES = _env_int("MAX_FETCH_RETRIES", 4)  # per-URL retry attempts
 BACKOFF_BASE = _env_int("BACKOFF_BASE", 2)         # exponential backoff base (sec)
-SEED_RETRY_COOLDOWN = _env_int("SEED_RETRY_COOLDOWN", 25)  # first-run empty-retry wait
 
 # Optional: only alert when a title contains one of these (case-insensitive).
 KEYWORDS = _env_list("KEYWORDS", [])
@@ -464,44 +463,23 @@ def watched_categories(session=None) -> list[str]:
     return list(STORE_URLS)
 
 
-def get_current_products(session=None, first_run=False) -> dict:
-    """
-    Sweep every watched category page into one combined dict.
-
-    On the very first run we seed silently, so a category that gets throttled
-    to an empty result MUST be recovered — otherwise its whole existing catalog
-    would later surface as false "NEW" alerts. So on first run, empty categories
-    are retried after a cooldown that lets Akamai's rate limit clear.
-    """
+def get_current_products(session=None) -> dict:
+    """Sweep every watched category page into one combined dict."""
     combined = {}
     urls = watched_categories(session=session)
     # Shuffle order each sweep so no single category is perpetually fetched last
-    # (and thus perpetually starved by cumulative Akamai throttling).
+    # (and thus perpetually starved by cumulative Akamai throttling). Categories
+    # that come back empty this sweep are simply skipped; they seed silently the
+    # first time they are reachable (see check_once's per-category guard), so a
+    # transient throttle never turns into a flood of false "NEW" alerts.
     random.shuffle(urls)
-
-    empty_urls = []
     for url in urls:
         html = fetch_with_backoff(url, session=session)
         found = parse_products(html) if html else {}
         if not found:
-            log.info("0 products parsed from %s.", url)
-            empty_urls.append(url)
+            log.info("0 products parsed from %s (will retry next sweep).", url)
         combined.update(found)
         time.sleep(PER_URL_DELAY + random.uniform(0, 1))  # politeness
-
-    if first_run and empty_urls:
-        for url in empty_urls:
-            log.info("Seed run: cooling down %ds then retrying empty %s",
-                     SEED_RETRY_COOLDOWN, url)
-            time.sleep(SEED_RETRY_COOLDOWN)
-            html = fetch_with_backoff(url, session=session)
-            found = parse_products(html) if html else {}
-            if found:
-                log.info("Seed retry recovered %d products from %s", len(found), url)
-                combined.update(found)
-            else:
-                log.warning("Seed retry still empty for %s (will seed on a later "
-                            "sweep once reachable).", url)
     return combined
 
 
@@ -518,34 +496,50 @@ def passes_keywords(title: str) -> bool:
     return not KEYWORDS or any(k.lower() in title.lower() for k in KEYWORDS)
 
 
+def category_of(url: str) -> str:
+    """First path segment of a product URL, e.g. .../socks/handle/id.html -> socks."""
+    path = urlparse(url).path.strip("/")
+    return path.split("/", 1)[0] if path else ""
+
+
 # ------------------------- CORE LOOP -------------------------
 def check_once(seen: dict, session=None) -> dict:
-    first_run = len(seen) == 0
-    current = get_current_products(session=session, first_run=first_run)
+    current = get_current_products(session=session)
     if not current:
         log.warning("No products fetched this sweep; keeping previous state.")
         return seen
 
+    # Categories we've already recorded. A category appearing for the FIRST time
+    # (initial run, or one that was throttled to empty on earlier sweeps) is
+    # seeded silently — otherwise its whole existing catalog would fire as false
+    # "NEW" alerts. Genuine NEW/RESTOCK detection kicks in once a category is
+    # seeded. State only ever accumulates, so a later transient empty is safe.
+    seeded_categories = {category_of(u) for u in seen}
+
     hits = []
+    seeded_now = 0
     for url, prod in current.items():
         was = seen.get(url)
         is_new = was is None
         restocked = was is not None and not was.get("available") and prod["available"]
-        if (is_new or restocked) and prod["available"] and passes_keywords(prod["title"]):
+        category_known = category_of(url) in seeded_categories
+
+        if is_new and not category_known:
+            seeded_now += 1  # first sighting of this category -> seed, don't alert
+        elif (is_new or restocked) and prod["available"] and passes_keywords(prod["title"]):
             hits.append((url, prod, "NEW" if is_new else "RESTOCK"))
         seen[url] = prod
 
     save_seen(seen)
 
-    if first_run:
-        log.info("Seeded %d products. Watching for changes...", len(current))
-        return seen
+    if seeded_now:
+        log.info("Seeded %d products from new categories (silent).", seeded_now)
 
     if hits:
         send_batch(hits)
         for url, prod, kind in hits:
             log.info("Alerted: %s %s", kind, prod["title"])
-    else:
+    elif not seeded_now:
         log.info("No changes (%d products live).", len(current))
     return seen
 

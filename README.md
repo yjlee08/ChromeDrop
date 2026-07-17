@@ -118,5 +118,16 @@ the headless-browser fallback works out of the box.
 ## Notes
 
 - No database — state is a single JSON file.
-- If the site markup changes and `0 products parsed` shows up in the logs,
-  `parse_products()` is where to look; it's covered by tests to catch regressions.
+- **Akamai throttling & silent seeding.** Under repeated polling the store may
+  serve a stripped page for a heavy category (observed on `scents`), so that
+  category can parse to 0 on a given sweep. This is handled safely: state only
+  ever accumulates, and a category is **seeded silently the first time it's
+  reachable** (tracked per-category). So a category throttled during the initial
+  seed won't later dump its whole existing catalog as false `NEW` alerts — you
+  only get alerted for genuinely new drops/restocks once a category is seeded.
+  Sweep order is also shuffled each cycle so no category is perpetually starved.
+- Plain `requests` is the reliable fetch path here (full server-rendered HTML);
+  headless Playwright is a fallback for hard 403/challenge blocks only.
+- If the site markup changes and `0 products parsed` persists across sweeps for
+  a category that should have items, `parse_products()` is where to look; it's
+  covered by tests to catch regressions.

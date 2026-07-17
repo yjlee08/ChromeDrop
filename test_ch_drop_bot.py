@@ -329,33 +329,69 @@ def test_chunk_hits_batches_many_into_few_messages(monkeypatch):
         assert f"Item {i}" in joined
 
 
-def test_first_run_retries_empty_categories(monkeypatch):
-    """On first run, a category that starts empty is retried after a cooldown."""
-    monkeypatch.setattr(ch_drop_bot, "watched_categories",
-                        lambda session=None: [f"{BASE}/socks", f"{BASE}/scents"])
-    monkeypatch.setattr(ch_drop_bot.time, "sleep", lambda s: None)
-    monkeypatch.setattr(ch_drop_bot, "PER_URL_DELAY", 0)
+def test_category_of():
+    assert ch_drop_bot.category_of(f"{BASE}/socks/ch-logo-socks/1.html") == "socks"
+    assert ch_drop_bot.category_of(f"{BASE}/scents/22-edp/2.html") == "scents"
 
-    calls = {f"{BASE}/scents": 0}
 
-    def fake_backoff(url, session=None):
-        if url == f"{BASE}/socks":
-            return CATEGORY_HTML  # parses to 3 socks
-        calls[url] += 1
-        # scents: empty the first time, populated on the cooldown retry.
-        return "" if calls[url] == 1 else CATEGORY_HTML
+def _run_check_once(monkeypatch, seen, current, sent):
+    """Drive check_once with a fixed `current` sweep and capture Telegram sends."""
+    monkeypatch.setattr(ch_drop_bot, "get_current_products", lambda session=None: current)
+    monkeypatch.setattr(ch_drop_bot, "save_seen", lambda s: None)
+    monkeypatch.setattr(ch_drop_bot, "send_batch", lambda hits: sent.extend(hits))
+    return ch_drop_bot.check_once(seen)
 
-    monkeypatch.setattr(ch_drop_bot, "fetch_with_backoff", fake_backoff)
 
-    # first_run=False: scents stays empty (no retry)
-    prods_no_retry = ch_drop_bot.get_current_products(first_run=False)
-    assert calls[f"{BASE}/scents"] == 1
+def test_first_run_seeds_silently(monkeypatch):
+    """Empty state: everything is seeded, nothing is alerted."""
+    current = {
+        f"{BASE}/socks/a/1.html": {"title": "A", "price": "$1", "available": True},
+        f"{BASE}/socks/b/2.html": {"title": "B", "price": "$2", "available": True},
+    }
+    sent = []
+    seen = _run_check_once(monkeypatch, {}, current, sent)
+    assert sent == []
+    assert set(seen) == set(current)
 
-    calls[f"{BASE}/scents"] = 0
-    # first_run=True: scents empty -> retried -> recovered
-    prods_retry = ch_drop_bot.get_current_products(first_run=True)
-    assert calls[f"{BASE}/scents"] == 2
-    assert len(prods_retry) >= 3
+
+def test_new_category_appearing_later_seeds_silently(monkeypatch):
+    """
+    A category first seen on a LATER sweep (e.g. scents was throttled during the
+    initial seed) must seed silently, not flood 21 false NEW alerts.
+    """
+    seen = {f"{BASE}/socks/a/1.html": {"title": "A", "price": "$1", "available": True}}
+    current = {
+        f"{BASE}/socks/a/1.html": {"title": "A", "price": "$1", "available": True},
+        f"{BASE}/scents/x/9.html": {"title": "Scent X", "price": "$9", "available": True},
+        f"{BASE}/scents/y/8.html": {"title": "Scent Y", "price": "$8", "available": True},
+    }
+    sent = []
+    _run_check_once(monkeypatch, seen, current, sent)
+    assert sent == []  # scents is a brand-new category -> silent seed
+
+
+def test_new_product_in_seeded_category_alerts(monkeypatch):
+    """Once a category is seeded, a genuinely new product alerts as NEW."""
+    seen = {f"{BASE}/socks/a/1.html": {"title": "A", "price": "$1", "available": True}}
+    current = {
+        f"{BASE}/socks/a/1.html": {"title": "A", "price": "$1", "available": True},
+        f"{BASE}/socks/new/3.html": {"title": "New Drop", "price": "$3", "available": True},
+    }
+    sent = []
+    _run_check_once(monkeypatch, seen, current, sent)
+    assert len(sent) == 1
+    assert sent[0][2] == "NEW"
+    assert sent[0][1]["title"] == "New Drop"
+
+
+def test_restock_in_seeded_category_alerts(monkeypatch):
+    """A sold-out item coming back in a seeded category alerts as RESTOCK."""
+    seen = {f"{BASE}/socks/a/1.html": {"title": "A", "price": "$1", "available": False}}
+    current = {f"{BASE}/socks/a/1.html": {"title": "A", "price": "$1", "available": True}}
+    sent = []
+    _run_check_once(monkeypatch, seen, current, sent)
+    assert len(sent) == 1
+    assert sent[0][2] == "RESTOCK"
 
 
 def test_send_batch_throttles(monkeypatch):
