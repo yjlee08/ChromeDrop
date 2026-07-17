@@ -120,6 +120,9 @@ HEADERS = {
 # This deliberately excludes /socks (category) and /terms.html (one segment).
 PRODUCT_RE = re.compile(r"^/[^/]+/[^/]+/[^/]+\.html$")
 PRICE_RE = re.compile(r"^\$\s?\d")
+# A real category slug is plain lowercase words/hyphens — this rejects JS hrefs
+# like "void(0);" and other non-path junk that shows up in nav anchors.
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 # Telegram rate limits: ~30 msgs/sec globally but ~1 msg/sec to a single chat.
 TELEGRAM_MAX_ITEMS_PER_MSG = _env_int("TELEGRAM_MAX_ITEMS_PER_MSG", 10)
@@ -291,9 +294,11 @@ def discover_categories(html: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     seen: dict[str, None] = {}
     skip = {
-        "account", "login", "cart", "search", "wishlist", "checkout",
-        "customer-service", "stores", "legal", "privacy", "terms",
-        "gift-cards", "gift-card", "sitemap",
+        "account", "login", "sign-in", "cart", "search", "wishlist", "checkout",
+        "customer-service", "contact", "stores", "locations", "find-us",
+        "book-appointment", "appointment", "magazine", "journal", "about",
+        "faq", "help", "shipping", "returns", "careers", "press", "newsletter",
+        "legal", "privacy", "terms", "gift-cards", "gift-card", "sitemap",
     }
     for a in soup.find_all("a", href=True):
         href = a["href"].split("?")[0].split("#")[0]
@@ -305,7 +310,7 @@ def discover_categories(html: str) -> list[str]:
         if len(segments) != 1:
             continue
         slug = segments[0]
-        if slug.endswith(".html") or slug in skip:
+        if slug.endswith(".html") or slug in skip or not SLUG_RE.match(slug):
             continue
         category_url = f"{BASE}/{slug}"
         seen.setdefault(category_url, None)
@@ -364,62 +369,81 @@ def fetch_via_playwright(url: str, timeout_ms: int = 30_000) -> str:
             browser.close()
 
 
+def _try_playwright(url: str) -> str | None:
+    """Best-effort headless render; returns None on any Playwright error."""
+    try:
+        return fetch_via_playwright(url)
+    except Exception as e:  # noqa: BLE001 - playwright surfaces many types
+        log.error("Playwright fetch failed for %s: %s", url, e)
+        return None
+
+
 def fetch_html(url: str, strategy: str = None, session=None) -> str | None:
     """
     Fetch a category page's HTML using the configured strategy.
 
       requests   -> only plain requests
       playwright -> only headless browser
-      auto       -> requests first; fall back to playwright on a challenge,
-                    a transport error, or an empty parse.
+      auto       -> requests first; escalate to Playwright ONLY on a hard block
+                    (403 / challenge interstitial). A merely-empty parse is left
+                    for fetch_with_backoff to retry, because on this site plain
+                    requests gets the full server-rendered page while headless
+                    Chromium is often served a stripped/challenged one — so a
+                    requests retry recovers more reliably than the browser does.
 
-    Returns HTML, or None if nothing usable could be fetched.
+    Returns HTML (possibly empty), or None if nothing could be fetched.
     """
     strategy = (strategy or FETCH_STRATEGY or "auto").lower()
 
     if strategy == "playwright":
-        try:
-            return fetch_via_playwright(url)
-        except Exception as e:  # noqa: BLE001 - playwright surfaces many types
-            log.error("Playwright fetch failed for %s: %s", url, e)
-            return None
+        return _try_playwright(url)
 
     status, html = fetch_via_requests(url, session=session)
 
     if strategy == "requests":
         return html or None
 
-    # auto: decide whether requests is good enough or we must escalate.
-    blocked = looks_like_challenge(status, html)
-    empty = (not blocked) and (not parse_products(html))
-    if blocked or empty:
-        reason = "challenge/block" if blocked else "empty parse"
-        log.info("requests %s for %s (status=%s) — falling back to Playwright",
-                 reason, url, status)
-        try:
-            return fetch_via_playwright(url)
-        except Exception as e:  # noqa: BLE001
-            log.error("Playwright fallback failed for %s: %s", url, e)
-            return html or None
+    # auto: only a genuine block warrants the (weaker, slower) browser fallback.
+    if looks_like_challenge(status, html):
+        log.info("requests blocked for %s (status=%s) — trying Playwright", url, status)
+        pw = _try_playwright(url)
+        return pw if pw else (html or None)
     return html
 
 
 def fetch_with_backoff(url: str, session=None) -> str | None:
-    """Fetch one URL with exponential backoff across transient failures."""
+    """
+    Fetch one URL, retrying transient empty results with exponential backoff.
+
+    Order for `auto`: keep retrying plain requests (which is what actually works
+    on this site); if every attempt still parses to zero products, make ONE
+    last-resort Playwright attempt before giving up.
+    """
+    last_html = None
     for attempt in range(1, MAX_FETCH_RETRIES + 1):
         html = fetch_html(url, session=session)
         if html and parse_products(html):
             return html
-        if html and FETCH_STRATEGY == "requests":
+        last_html = html or last_html
+        if FETCH_STRATEGY == "requests" and html:
             # requests-only mode: trust the (possibly empty) result, no browser.
             return html
         if attempt < MAX_FETCH_RETRIES:
             delay = BACKOFF_BASE ** attempt + random.uniform(0, 1)
-            log.warning("Fetch attempt %d/%d for %s yielded nothing; retrying in %.1fs",
+            log.warning("Fetch attempt %d/%d for %s parsed 0 products; retrying in %.1fs",
                         attempt, MAX_FETCH_RETRIES, url, delay)
             time.sleep(delay)
+
+    # Persistent empty in auto mode: the page may be genuinely JS-rendered.
+    if FETCH_STRATEGY == "auto":
+        log.info("requests never parsed products for %s — last-resort Playwright", url)
+        pw = _try_playwright(url)
+        if pw and parse_products(pw):
+            return pw
+        last_html = pw or last_html
+
     log.error("Giving up on %s after %d attempts", url, MAX_FETCH_RETRIES)
-    return None
+    return last_html
 
 
 def watched_categories(session=None) -> list[str]:

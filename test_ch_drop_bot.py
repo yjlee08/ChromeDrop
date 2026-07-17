@@ -170,18 +170,55 @@ def test_auto_falls_back_to_playwright_on_block(monkeypatch):
     assert calls["pw"] == 1
 
 
-def test_auto_falls_back_on_empty_parse(monkeypatch):
-    """200 OK but no products parsed -> escalate to Playwright."""
-    calls = {"pw": 0}
+def test_auto_empty_parse_does_not_immediately_use_playwright(monkeypatch):
+    """
+    200 OK but no products parsed is NOT a hard block: fetch_html returns the
+    requests body and leaves retrying to fetch_with_backoff (requests is the
+    reliable path on this site; headless Chromium gets challenged).
+    """
     monkeypatch.setattr(ch_drop_bot, "fetch_via_requests",
                         lambda url, session=None: (200, "<html><body>no tiles</body></html>"))
+
+    def boom(url, timeout_ms=30_000):
+        raise AssertionError("Playwright must not run on a mere empty parse")
+
+    monkeypatch.setattr(ch_drop_bot, "fetch_via_playwright", boom)
+    html = ch_drop_bot.fetch_html("https://x/socks", strategy="auto")
+    assert "no tiles" in html
+
+
+def test_backoff_retries_requests_then_recovers(monkeypatch):
+    """A transient empty parse is recovered by retrying requests, not Playwright."""
+    responses = iter([(200, "<html>empty</html>"), (200, CATEGORY_HTML)])
+    monkeypatch.setattr(ch_drop_bot, "fetch_via_requests",
+                        lambda url, session=None: next(responses))
+    monkeypatch.setattr(ch_drop_bot.time, "sleep", lambda s: None)
+    monkeypatch.setattr(ch_drop_bot, "FETCH_STRATEGY", "auto")
+    monkeypatch.setattr(ch_drop_bot, "MAX_FETCH_RETRIES", 3)
+
+    def boom(url, timeout_ms=30_000):
+        raise AssertionError("Playwright must not run while requests still recovers")
+
+    monkeypatch.setattr(ch_drop_bot, "fetch_via_playwright", boom)
+    html = ch_drop_bot.fetch_with_backoff("https://x/socks")
+    assert html == CATEGORY_HTML
+
+
+def test_backoff_last_resort_playwright_on_persistent_empty(monkeypatch):
+    """When requests never yields products, fall back to Playwright once."""
+    calls = {"pw": 0}
+    monkeypatch.setattr(ch_drop_bot, "fetch_via_requests",
+                        lambda url, session=None: (200, "<html>empty</html>"))
+    monkeypatch.setattr(ch_drop_bot.time, "sleep", lambda s: None)
+    monkeypatch.setattr(ch_drop_bot, "FETCH_STRATEGY", "auto")
+    monkeypatch.setattr(ch_drop_bot, "MAX_FETCH_RETRIES", 2)
 
     def fake_pw(url, timeout_ms=30_000):
         calls["pw"] += 1
         return CATEGORY_HTML
 
     monkeypatch.setattr(ch_drop_bot, "fetch_via_playwright", fake_pw)
-    html = ch_drop_bot.fetch_html("https://x/socks", strategy="auto")
+    html = ch_drop_bot.fetch_with_backoff("https://x/socks")
     assert html == CATEGORY_HTML
     assert calls["pw"] == 1
 
@@ -241,6 +278,26 @@ def test_discover_categories_excludes_products_and_utility():
     # Utility/legal single-segment links are filtered out.
     assert f"{BASE}/terms" not in cats
     assert f"{BASE}/customer-service" not in cats
+
+
+def test_discover_categories_rejects_js_hrefs_and_utility_pages():
+    """JS hrefs like void(0); and utility slugs like /contact are not categories."""
+    html = """
+    <nav>
+      <a href="void(0);">Menu</a>
+      <a href="/contact">Contact</a>
+      <a href="/locations.html">Stores</a>
+      <a href="/socks">Socks</a>
+      <a href="/scents">Scents</a>
+    </nav>
+    """
+    cats = ch_drop_bot.discover_categories(html)
+    assert f"{BASE}/socks" in cats
+    assert f"{BASE}/scents" in cats
+    assert f"{BASE}/void(0);" not in cats
+    assert not any("void" in c for c in cats)
+    assert f"{BASE}/contact" not in cats
+    assert not any(".html" in c for c in cats)
 
 
 # --------------------------------------------------------------------------
