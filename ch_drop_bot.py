@@ -26,6 +26,7 @@ First run just records what's there (no spam). Alerts start next cycle.
 Setup:
   pip install -r requirements.txt
   cp .env.example .env   # then fill in BOT_TOKEN and CHAT_ID
+  python tg_setup.py     # find your CHAT_ID + send a test message
   python ch_drop_bot.py
 """
 
