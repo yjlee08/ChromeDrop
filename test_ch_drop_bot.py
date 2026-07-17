@@ -114,3 +114,175 @@ def test_query_string_variants_group_to_one_product():
 
 def test_empty_page_yields_no_products():
     assert parse_products("<html><body>nothing here</body></html>") == {}
+
+
+# --------------------------------------------------------------------------
+# Fetch-fallback decision logic (mocked responses)
+# --------------------------------------------------------------------------
+
+CHALLENGE_HTML = (
+    "<html><body><h1>Access Denied</h1>"
+    "<p>Reference #18.abcd. You don't have permission.</p></body></html>"
+)
+
+
+def test_looks_like_challenge_on_403():
+    assert ch_drop_bot.looks_like_challenge(403, "<html>whatever</html>") is True
+
+
+def test_looks_like_challenge_on_rate_limit_and_unavailable():
+    assert ch_drop_bot.looks_like_challenge(429, "x") is True
+    assert ch_drop_bot.looks_like_challenge(503, "x") is True
+
+
+def test_looks_like_challenge_on_empty_body():
+    assert ch_drop_bot.looks_like_challenge(200, "") is True
+    assert ch_drop_bot.looks_like_challenge(200, "   ") is True
+
+
+def test_looks_like_challenge_on_small_interstitial():
+    assert ch_drop_bot.looks_like_challenge(200, CHALLENGE_HTML) is True
+
+
+def test_real_page_is_not_a_challenge():
+    assert ch_drop_bot.looks_like_challenge(200, CATEGORY_HTML) is False
+
+
+def test_large_page_mentioning_marker_is_not_a_challenge():
+    # A genuine page may say "enable javascript" in a footer; if it's large and
+    # rich, don't misclassify it as a block.
+    big = CATEGORY_HTML + ("<p>please enable javascript for maps</p>" + "x" * 50_000)
+    assert ch_drop_bot.looks_like_challenge(200, big) is False
+
+
+def test_auto_falls_back_to_playwright_on_block(monkeypatch):
+    calls = {"pw": 0}
+    monkeypatch.setattr(ch_drop_bot, "fetch_via_requests",
+                        lambda url, session=None: (403, CHALLENGE_HTML))
+
+    def fake_pw(url, timeout_ms=30_000):
+        calls["pw"] += 1
+        return CATEGORY_HTML
+
+    monkeypatch.setattr(ch_drop_bot, "fetch_via_playwright", fake_pw)
+    html = ch_drop_bot.fetch_html("https://x/socks", strategy="auto")
+    assert html == CATEGORY_HTML
+    assert calls["pw"] == 1
+
+
+def test_auto_falls_back_on_empty_parse(monkeypatch):
+    """200 OK but no products parsed -> escalate to Playwright."""
+    calls = {"pw": 0}
+    monkeypatch.setattr(ch_drop_bot, "fetch_via_requests",
+                        lambda url, session=None: (200, "<html><body>no tiles</body></html>"))
+
+    def fake_pw(url, timeout_ms=30_000):
+        calls["pw"] += 1
+        return CATEGORY_HTML
+
+    monkeypatch.setattr(ch_drop_bot, "fetch_via_playwright", fake_pw)
+    html = ch_drop_bot.fetch_html("https://x/socks", strategy="auto")
+    assert html == CATEGORY_HTML
+    assert calls["pw"] == 1
+
+
+def test_auto_uses_requests_when_ok(monkeypatch):
+    """A good requests response must NOT trigger the browser fallback."""
+    monkeypatch.setattr(ch_drop_bot, "fetch_via_requests",
+                        lambda url, session=None: (200, CATEGORY_HTML))
+
+    def boom(url, timeout_ms=30_000):
+        raise AssertionError("Playwright should not be called on a good response")
+
+    monkeypatch.setattr(ch_drop_bot, "fetch_via_playwright", boom)
+    html = ch_drop_bot.fetch_html("https://x/socks", strategy="auto")
+    assert html == CATEGORY_HTML
+
+
+def test_requests_strategy_never_falls_back(monkeypatch):
+    """strategy=requests returns the (possibly empty) result, no browser."""
+    monkeypatch.setattr(ch_drop_bot, "fetch_via_requests",
+                        lambda url, session=None: (403, CHALLENGE_HTML))
+
+    def boom(url, timeout_ms=30_000):
+        raise AssertionError("Playwright must not run in requests-only mode")
+
+    monkeypatch.setattr(ch_drop_bot, "fetch_via_playwright", boom)
+    # 403 body is non-empty text, so it is returned as-is (not None).
+    assert ch_drop_bot.fetch_html("https://x/socks", strategy="requests") == CHALLENGE_HTML
+
+
+def test_playwright_strategy_ignores_requests(monkeypatch):
+    def boom(url, session=None):
+        raise AssertionError("requests must not run in playwright-only mode")
+
+    monkeypatch.setattr(ch_drop_bot, "fetch_via_requests", boom)
+    monkeypatch.setattr(ch_drop_bot, "fetch_via_playwright",
+                        lambda url, timeout_ms=30_000: CATEGORY_HTML)
+    assert ch_drop_bot.fetch_html("https://x/socks", strategy="playwright") == CATEGORY_HTML
+
+
+# --------------------------------------------------------------------------
+# Category discovery
+# --------------------------------------------------------------------------
+
+def test_discover_categories_from_nav():
+    cats = ch_drop_bot.discover_categories(CATEGORY_HTML)
+    assert f"{BASE}/socks" in cats
+    assert f"{BASE}/scents" in cats
+    assert f"{BASE}/baccarat" in cats
+    assert f"{BASE}/boxers-leggings" in cats
+
+
+def test_discover_categories_excludes_products_and_utility():
+    cats = ch_drop_bot.discover_categories(CATEGORY_HTML)
+    # Product detail pages (three segments, .html) are not categories.
+    assert not any(".html" in c for c in cats)
+    # Utility/legal single-segment links are filtered out.
+    assert f"{BASE}/terms" not in cats
+    assert f"{BASE}/customer-service" not in cats
+
+
+# --------------------------------------------------------------------------
+# Telegram batching / throttling
+# --------------------------------------------------------------------------
+
+def test_format_hit_contains_all_fields():
+    prod = {"title": "CH Logo Socks", "price": "$255", "available": True}
+    block = ch_drop_bot.format_hit(f"{BASE}/socks/ch-logo-socks/1.html", prod, "NEW")
+    assert "CH Logo Socks" in block
+    assert "$255" in block
+    assert f"{BASE}/socks/ch-logo-socks/1.html" in block
+    assert "NEW" in block
+
+
+def test_chunk_hits_batches_many_into_few_messages(monkeypatch):
+    monkeypatch.setattr(ch_drop_bot, "TELEGRAM_MAX_ITEMS_PER_MSG", 10)
+    hits = [
+        (f"{BASE}/socks/item-{i}/{i}.html",
+         {"title": f"Item {i}", "price": "$100", "available": True},
+         "NEW")
+        for i in range(25)
+    ]
+    messages = ch_drop_bot._chunk_hits(hits)
+    assert len(messages) == 3  # 10 + 10 + 5
+    # Every item is represented exactly once across all messages.
+    joined = "\n".join(messages)
+    for i in range(25):
+        assert f"Item {i}" in joined
+
+
+def test_send_batch_throttles(monkeypatch):
+    posted = []
+    sleeps = []
+    monkeypatch.setattr(ch_drop_bot, "_post_telegram", lambda text: posted.append(text) or True)
+    monkeypatch.setattr(ch_drop_bot.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(ch_drop_bot, "TELEGRAM_MAX_ITEMS_PER_MSG", 2)
+    hits = [
+        (f"{BASE}/socks/item-{i}/{i}.html",
+         {"title": f"Item {i}", "price": "$100", "available": True}, "NEW")
+        for i in range(5)
+    ]
+    ch_drop_bot.send_batch(hits)
+    assert len(posted) == 3          # 2 + 2 + 1
+    assert len(sleeps) == 2          # throttle between the 3 messages
