@@ -394,6 +394,34 @@ def test_restock_in_seeded_category_alerts(monkeypatch):
     assert sent[0][2] == "RESTOCK"
 
 
+def test_handle_command_status():
+    reply = ch_drop_bot.handle_command("/status")
+    assert reply is not None and "running" in reply.lower()
+
+
+def test_handle_command_status_with_botname_suffix():
+    # Telegram appends @botname in groups; the handler must still match.
+    assert ch_drop_bot.handle_command("/status@yjchromedropbot") is not None
+
+
+def test_handle_command_ping():
+    assert "pong" in ch_drop_bot.handle_command("/ping").lower()
+
+
+def test_handle_command_unknown_and_empty():
+    assert ch_drop_bot.handle_command("hello there") is None
+    assert ch_drop_bot.handle_command("") is None
+    assert ch_drop_bot.handle_command("/unknown") is None
+
+
+def test_status_reply_reflects_tracked_count(monkeypatch):
+    monkeypatch.setattr(ch_drop_bot, "_TRACKED_COUNT", 42)
+    monkeypatch.setattr(ch_drop_bot, "_LAST_SWEEP_AT", None)
+    reply = ch_drop_bot.build_status_reply()
+    assert "42 products" in reply
+    assert "not yet" in reply  # no sweep recorded yet
+
+
 def test_send_batch_throttles(monkeypatch):
     posted = []
     sleeps = []

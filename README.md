@@ -54,6 +54,16 @@ python ch_drop_bot.py
 
 First run seeds `seen.json` silently; alerts start on the next sweep.
 
+### Check it's alive from your phone
+
+Message the bot on Telegram:
+
+- `/status` → replies with products tracked, time since last sweep, and uptime.
+- `/ping` → replies `pong` if it's running.
+
+Silence means it isn't running. (Only your own chat gets answered.) Set
+`COMMANDS_ENABLED=false` to turn this off.
+
 ## Configuration
 
 All settings come from the environment / `.env` (see `.env.example`):

@@ -36,6 +36,7 @@ import os
 import json
 import random
 import re
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -144,6 +145,18 @@ CHALLENGE_MARKERS = (
 # ----------------------------------------------------------
 
 
+# Reply to Telegram commands (/status, /ping) so you can check liveness from
+# your phone without touching the server. Set COMMANDS_ENABLED=false to disable.
+COMMANDS_ENABLED = os.getenv("COMMANDS_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# Live runtime status, updated each sweep and reported by /status.
+_STARTED_AT = time.time()
+_LAST_SWEEP_AT = None
+_TRACKED_COUNT = 0
+
+
 def setup_logging() -> None:
     """stdout + rotating file, structured with timestamps and levels."""
     if log.handlers:  # already configured (e.g. re-entrant / tests)
@@ -232,6 +245,91 @@ def send_batch(hits: list[tuple]) -> None:
         _post_telegram(msg)
         if i + 1 < len(messages):
             time.sleep(TELEGRAM_SEND_DELAY)
+
+
+# ------------------------- COMMANDS -------------------------
+def _fmt_ago(ts) -> str:
+    if not ts:
+        return "not yet"
+    secs = int(time.time() - ts)
+    if secs < 60:
+        return f"{secs}s ago"
+    return f"{secs // 60}m {secs % 60}s ago"
+
+
+def build_status_reply() -> str:
+    """Human-readable liveness report for the /status command."""
+    up = int(time.time() - _STARTED_AT)
+    return (
+        "✅ <b>Chrome Hearts monitor is running.</b>\n"
+        f"Tracking: {_TRACKED_COUNT} products\n"
+        f"Last sweep: {_fmt_ago(_LAST_SWEEP_AT)}\n"
+        f"Uptime: {up // 3600}h {(up % 3600) // 60}m\n"
+        f"Strategy: {FETCH_STRATEGY}"
+    )
+
+
+def handle_command(text: str) -> str | None:
+    """Map an incoming message to a reply, or None if it's not a command."""
+    if not text:
+        return None
+    cmd = text.strip().split()[0].lower().split("@")[0]  # strip @botname suffix
+    if cmd in ("/status", "/health", "/check"):
+        return build_status_reply()
+    if cmd == "/ping":
+        return "🏓 pong — I'm alive."
+    if cmd == "/start":
+        return "👋 Chrome Hearts drop monitor. Commands: /status, /ping"
+    return None
+
+
+def _telegram_command_listener() -> None:
+    """
+    Long-poll getUpdates and reply to commands from the configured chat only.
+
+    Runs in a daemon thread so it never blocks the monitor loop. Only one
+    process may consume getUpdates per bot token (Telegram returns 409 to a
+    second consumer), which is fine for a single 24/7 instance.
+    """
+    api = f"https://api.telegram.org/bot{BOT_TOKEN}"
+    offset = None
+    # Drain any messages queued before startup so we don't reply to stale ones.
+    try:
+        r = requests.get(f"{api}/getUpdates", timeout=20).json()
+        if r.get("ok") and r["result"]:
+            offset = r["result"][-1]["update_id"] + 1
+    except requests.RequestException:
+        pass
+
+    while True:
+        try:
+            params = {"timeout": 50}
+            if offset is not None:
+                params["offset"] = offset
+            r = requests.get(f"{api}/getUpdates", params=params, timeout=60).json()
+            if not r.get("ok"):
+                time.sleep(5)
+                continue
+            for upd in r["result"]:
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or upd.get("edited_message") or {}
+                chat = msg.get("chat", {})
+                # Only answer the owner; ignore anyone else who finds the bot.
+                if str(chat.get("id")) != str(CHAT_ID):
+                    continue
+                reply = handle_command(msg.get("text", ""))
+                if reply:
+                    requests.post(
+                        f"{api}/sendMessage",
+                        data={"chat_id": chat["id"], "text": reply,
+                              "parse_mode": "HTML"},
+                        timeout=20,
+                    )
+        except requests.RequestException:
+            time.sleep(5)
+        except Exception as e:  # noqa: BLE001 - listener must never die
+            log.warning("Command listener error: %s", e)
+            time.sleep(5)
 
 
 # ------------------------- PARSING -------------------------
@@ -532,6 +630,10 @@ def check_once(seen: dict, session=None) -> dict:
 
     save_seen(seen)
 
+    global _LAST_SWEEP_AT, _TRACKED_COUNT
+    _LAST_SWEEP_AT = time.time()
+    _TRACKED_COUNT = len(seen)
+
     if seeded_now:
         log.info("Seeded %d products from new categories (silent).", seeded_now)
 
@@ -552,8 +654,14 @@ def main():
         )
     session = requests.Session()
     seen = load_seen()
+    _TRACKED_COUNT_INIT = len(seen)
+    global _TRACKED_COUNT
+    _TRACKED_COUNT = _TRACKED_COUNT_INIT
     log.info("Monitor started (strategy=%s, discover=%s, state=%s).",
              FETCH_STRATEGY, DISCOVER_CATEGORIES, STATE_FILE)
+    if COMMANDS_ENABLED:
+        threading.Thread(target=_telegram_command_listener, daemon=True).start()
+        log.info("Telegram command listener started (/status, /ping).")
     while True:
         try:
             seen = check_once(seen, session=session)
