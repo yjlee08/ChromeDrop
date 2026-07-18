@@ -30,6 +30,7 @@ Setup:
   python ch_drop_bot.py
 """
 
+import hashlib
 import logging
 import logging.handlers
 import os
@@ -101,6 +102,11 @@ STORE_URLS = _env_list(
 DISCOVER_CATEGORIES = os.getenv("DISCOVER_CATEGORIES", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
+# How long to reuse a discovered category list before re-scraping the homepage.
+# Categories change rarely, so re-fetching the homepage every sweep is waste;
+# a new category is still picked up within this window, and known ones are
+# always covered by the STORE_URLS fallback.
+DISCOVERY_TTL = _env_int("DISCOVERY_TTL", 3600)
 
 CHECK_INTERVAL = _env_int("CHECK_INTERVAL", 120)   # base seconds between sweeps
 JITTER = _env_int("JITTER", 30)                    # random 0..JITTER extra sec/sweep
@@ -164,6 +170,11 @@ COMMANDS_ENABLED = os.getenv("COMMANDS_ENABLED", "true").strip().lower() in (
 _STARTED_AT = time.time()
 _LAST_SWEEP_AT = None
 _TRACKED_COUNT = 0
+
+# CPU savers (see parse_cached / watched_categories). Purely runtime caches;
+# they never change WHAT is detected, only avoid redundant work.
+_page_cache: dict = {}                       # url -> (html_sha1, parsed_products)
+_discovery_cache: dict = {"at": 0.0, "urls": None}
 
 
 def setup_logging() -> None:
@@ -390,6 +401,24 @@ def parse_products(html: str) -> dict:
     return products
 
 
+def parse_cached(url: str, html: str) -> dict:
+    """
+    parse_products() with a per-URL content cache.
+
+    Identical HTML — the common case when nothing changed, or when the same page
+    is examined twice within one sweep — is parsed only once. Byte-identical
+    input yields byte-identical output, so this NEVER changes what is detected;
+    it only skips redundant (and relatively expensive) BeautifulSoup work.
+    """
+    digest = hashlib.sha1(html.encode("utf-8", "ignore")).hexdigest()
+    cached = _page_cache.get(url)
+    if cached and cached[0] == digest:
+        return cached[1]
+    parsed = parse_products(html)
+    _page_cache[url] = (digest, parsed)
+    return parsed
+
+
 def discover_categories(html: str) -> list[str]:
     """
     Enumerate category URLs from a homepage's top nav.
@@ -531,7 +560,7 @@ def fetch_with_backoff(url: str, session=None) -> str | None:
     last_html = None
     for attempt in range(1, MAX_FETCH_RETRIES + 1):
         html = fetch_html(url, session=session)
-        if html and parse_products(html):
+        if html and parse_cached(url, html):
             return html
         last_html = html or last_html
         if FETCH_STRATEGY == "requests" and html:
@@ -547,7 +576,7 @@ def fetch_with_backoff(url: str, session=None) -> str | None:
     if FETCH_STRATEGY == "auto" and PLAYWRIGHT_ON_EMPTY:
         log.info("requests never parsed products for %s — last-resort Playwright", url)
         pw = _try_playwright(url)
-        if pw and parse_products(pw):
+        if pw and parse_cached(url, pw):
             return pw
         last_html = pw or last_html
 
@@ -557,18 +586,36 @@ def fetch_with_backoff(url: str, session=None) -> str | None:
 
 
 def watched_categories(session=None) -> list[str]:
-    """Discover categories from the nav; fall back to the configured list."""
+    """
+    Discover categories from the nav; fall back to the configured list.
+
+    The result is cached for DISCOVERY_TTL so we don't re-download and re-parse
+    the homepage every sweep. Categories change rarely and known ones are always
+    in the STORE_URLS fallback, so this doesn't affect drop detection.
+    """
     if not DISCOVER_CATEGORIES:
         return list(STORE_URLS)
+
+    now = time.time()
+    if (_discovery_cache["urls"] is not None
+            and now - _discovery_cache["at"] < DISCOVERY_TTL):
+        return list(_discovery_cache["urls"])
+
     home = fetch_html(BASE, session=session)
     if home:
         found = discover_categories(home)
         if found:
             # Union with configured URLs so a nav miss never drops a category.
             merged = list(dict.fromkeys(found + list(STORE_URLS)))
-            log.info("Discovered %d categories from nav (%d configured fallback)",
-                     len(found), len(STORE_URLS))
+            _discovery_cache["at"] = now
+            _discovery_cache["urls"] = merged
+            log.info("Discovered %d categories from nav (%d fallback); reusing for %ds",
+                     len(found), len(STORE_URLS), DISCOVERY_TTL)
             return merged
+
+    # Discovery failed this time: reuse the last good list if we have one.
+    if _discovery_cache["urls"] is not None:
+        return list(_discovery_cache["urls"])
     log.warning("Category discovery failed; using configured STORE_URLS")
     return list(STORE_URLS)
 
@@ -585,7 +632,7 @@ def get_current_products(session=None) -> dict:
     random.shuffle(urls)
     for url in urls:
         html = fetch_with_backoff(url, session=session)
-        found = parse_products(html) if html else {}
+        found = parse_cached(url, html) if html else {}
         if not found:
             log.info("0 products parsed from %s (will retry next sweep).", url)
         combined.update(found)

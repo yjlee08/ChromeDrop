@@ -116,6 +116,31 @@ def test_empty_page_yields_no_products():
     assert parse_products("<html><body>nothing here</body></html>") == {}
 
 
+def test_parse_cached_matches_parse_products_and_reuses(monkeypatch):
+    """parse_cached must equal parse_products, and skip re-parsing identical HTML."""
+    ch_drop_bot._page_cache.clear()
+    url = f"{BASE}/socks"
+    first = ch_drop_bot.parse_cached(url, CATEGORY_HTML)
+    assert first == parse_products(CATEGORY_HTML)
+
+    # A second call with identical HTML must NOT call parse_products again.
+    calls = {"n": 0}
+    real = ch_drop_bot.parse_products
+
+    def counting(html):
+        calls["n"] += 1
+        return real(html)
+
+    monkeypatch.setattr(ch_drop_bot, "parse_products", counting)
+    second = ch_drop_bot.parse_cached(url, CATEGORY_HTML)
+    assert second == first
+    assert calls["n"] == 0  # served from cache
+
+    # Changed HTML busts the cache and re-parses.
+    ch_drop_bot.parse_cached(url, CATEGORY_HTML + "<!-- changed -->")
+    assert calls["n"] == 1
+
+
 # --------------------------------------------------------------------------
 # Fetch-fallback decision logic (mocked responses)
 # --------------------------------------------------------------------------
