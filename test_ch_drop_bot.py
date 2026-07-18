@@ -508,6 +508,42 @@ def test_send_batch_retries_then_succeeds(monkeypatch):
     assert attempts["n"] == 2
 
 
+def test_parse_window():
+    assert ch_drop_bot._parse_window("14:00-22:00") == (840, 1320)
+    assert ch_drop_bot._parse_window("") is None
+    assert ch_drop_bot._parse_window("garbage") is None
+
+
+def test_within_slow_window_daytime(monkeypatch):
+    # slow window 14:00-22:00 = minutes 840..1320
+    monkeypatch.setattr(ch_drop_bot, "SLOW_WINDOW", (840, 1320))
+    assert ch_drop_bot.within_slow_window(13 * 60 + 59) is False  # 13:59 -> fast
+    assert ch_drop_bot.within_slow_window(14 * 60) is True         # 14:00 -> slow
+    assert ch_drop_bot.within_slow_window(21 * 60 + 59) is True    # 21:59 -> slow
+    assert ch_drop_bot.within_slow_window(22 * 60) is False        # 22:00 -> fast
+    assert ch_drop_bot.within_slow_window(6 * 60) is False         # 06:00 -> fast (drop time)
+
+
+def test_within_slow_window_wraps_midnight(monkeypatch):
+    monkeypatch.setattr(ch_drop_bot, "SLOW_WINDOW", (22 * 60, 2 * 60))
+    assert ch_drop_bot.within_slow_window(23 * 60) is True
+    assert ch_drop_bot.within_slow_window(1 * 60) is True
+    assert ch_drop_bot.within_slow_window(12 * 60) is False
+
+
+def test_no_window_means_never_slow(monkeypatch):
+    monkeypatch.setattr(ch_drop_bot, "SLOW_WINDOW", None)
+    assert ch_drop_bot.within_slow_window(15 * 60) is False
+
+
+def test_current_interval_switches(monkeypatch):
+    monkeypatch.setattr(ch_drop_bot, "SLOW_WINDOW", (840, 1320))  # 14:00-22:00
+    monkeypatch.setattr(ch_drop_bot, "CHECK_INTERVAL", 120)
+    monkeypatch.setattr(ch_drop_bot, "SLOW_INTERVAL", 600)
+    assert ch_drop_bot.current_interval(6 * 60) == 120    # 6am -> fast (2 min)
+    assert ch_drop_bot.current_interval(15 * 60) == 600   # 3pm -> slow (10 min)
+
+
 def test_handle_command_status():
     reply = ch_drop_bot.handle_command("/status")
     assert reply is not None and "running" in reply.lower()

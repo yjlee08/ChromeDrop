@@ -30,6 +30,7 @@ Setup:
   python ch_drop_bot.py
 """
 
+import datetime
 import hashlib
 import logging
 import logging.handlers
@@ -41,6 +42,7 @@ import threading
 import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -113,6 +115,31 @@ JITTER = _env_int("JITTER", 30)                    # random 0..JITTER extra sec/
 PER_URL_DELAY = _env_int("PER_URL_DELAY", 3)       # politeness pause between pages
 MAX_FETCH_RETRIES = _env_int("MAX_FETCH_RETRIES", 4)  # per-URL retry attempts
 BACKOFF_BASE = _env_int("BACKOFF_BASE", 2)         # exponential backoff base (sec)
+
+# Variable cadence: the store doesn't drop during SLOW_HOURS, so poll less often
+# then (SLOW_INTERVAL); the rest of the day — including the ~6am KST drop — uses
+# the faster CHECK_INTERVAL. Leave SLOW_HOURS empty to use CHECK_INTERVAL always.
+# SLOW_HOURS is "HH:MM-HH:MM" in SLOW_TZ (an IANA zone like Asia/Seoul).
+SLOW_HOURS = os.getenv("SLOW_HOURS", "").strip()
+SLOW_TZ = os.getenv("SLOW_TZ", "Asia/Seoul").strip()
+SLOW_INTERVAL = _env_int("SLOW_INTERVAL", 600)  # seconds between sweeps in-window
+
+
+def _parse_window(spec: str):
+    """'14:00-22:00' -> (840, 1320) minutes-of-day, or None if unset/invalid."""
+    if not spec:
+        return None
+    try:
+        start_s, end_s = spec.split("-")
+        sh, sm = (int(x) for x in start_s.strip().split(":"))
+        eh, em = (int(x) for x in end_s.strip().split(":"))
+        return (sh * 60 + sm, eh * 60 + em)
+    except Exception:
+        log.warning("Bad SLOW_HOURS %r — ignoring, using CHECK_INTERVAL always.", spec)
+        return None
+
+
+SLOW_WINDOW = _parse_window(SLOW_HOURS)
 
 # Optional: only alert when a title contains one of these (case-insensitive).
 KEYWORDS = _env_list("KEYWORDS", [])
@@ -301,12 +328,18 @@ def _fmt_ago(ts) -> str:
 def build_status_reply() -> str:
     """Human-readable liveness report for the /status command."""
     up = int(time.time() - _STARTED_AT)
+    cadence = f"\nCadence: every {CHECK_INTERVAL // 60}m"
+    if SLOW_WINDOW is not None:
+        now_min = SLOW_INTERVAL // 60 if within_slow_window() else CHECK_INTERVAL // 60
+        cadence = (f"\nCadence: every {now_min}m now "
+                   f"(slow {SLOW_INTERVAL // 60}m during {SLOW_HOURS} {SLOW_TZ})")
     return (
         "✅ <b>Chrome Hearts monitor is running.</b>\n"
         f"Tracking: {_TRACKED_COUNT} products\n"
         f"Last sweep: {_fmt_ago(_LAST_SWEEP_AT)}\n"
         f"Uptime: {up // 3600}h {(up % 3600) // 60}m\n"
         f"Strategy: {FETCH_STRATEGY}"
+        f"{cadence}"
     )
 
 
@@ -680,6 +713,31 @@ def category_of(url: str) -> str:
     return path.split("/", 1)[0] if path else ""
 
 
+def _now_minutes_in_tz() -> int:
+    """Current minute-of-day in SLOW_TZ (falls back to local time on error)."""
+    try:
+        now = datetime.datetime.now(ZoneInfo(SLOW_TZ)) if SLOW_TZ else datetime.datetime.now()
+    except Exception:  # noqa: BLE001 - bad/unknown tz -> local time
+        now = datetime.datetime.now()
+    return now.hour * 60 + now.minute
+
+
+def within_slow_window(now_minutes: int = None) -> bool:
+    """True if we're in the slow-polling window. False when no window is set."""
+    if SLOW_WINDOW is None:
+        return False
+    start, end = SLOW_WINDOW
+    cur = now_minutes if now_minutes is not None else _now_minutes_in_tz()
+    if start <= end:
+        return start <= cur < end
+    return cur >= start or cur < end  # window wraps past midnight
+
+
+def current_interval(now_minutes: int = None) -> int:
+    """Base seconds between sweeps right now: SLOW_INTERVAL in-window else fast."""
+    return SLOW_INTERVAL if within_slow_window(now_minutes) else CHECK_INTERVAL
+
+
 # ------------------------- CORE LOOP -------------------------
 def check_once(seen: dict, session=None) -> dict:
     current = get_current_products(session=session)
@@ -747,18 +805,21 @@ def main():
     _TRACKED_COUNT_INIT = len(seen)
     global _TRACKED_COUNT
     _TRACKED_COUNT = _TRACKED_COUNT_INIT
-    log.info("Monitor started (strategy=%s, discover=%s, state=%s).",
-             FETCH_STRATEGY, DISCOVER_CATEGORIES, STATE_FILE)
+    cadence = (f"{CHECK_INTERVAL}s, slow {SLOW_INTERVAL}s during {SLOW_HOURS} {SLOW_TZ}"
+               if SLOW_WINDOW else f"{CHECK_INTERVAL}s")
+    log.info("Monitor started (strategy=%s, discover=%s, state=%s, cadence=%s).",
+             FETCH_STRATEGY, DISCOVER_CATEGORIES, STATE_FILE, cadence)
     if COMMANDS_ENABLED:
         threading.Thread(target=_telegram_command_listener, daemon=True).start()
         log.info("Telegram command listener started (/status, /ping).")
     while True:
         try:
             seen = check_once(seen, session=session)
-        except Exception as e:  # noqa: BLE001 - never let one bad sweep kill the loop
+        except Exception as e:  # noqa: BLE001 - one bad sweep must not kill the loop
             log.exception("Sweep failed: %s", e)
-        sleep_for = CHECK_INTERVAL + random.uniform(0, JITTER)
-        log.info("Sleeping %.0fs until next sweep.", sleep_for)
+        slow = within_slow_window()
+        sleep_for = (SLOW_INTERVAL if slow else CHECK_INTERVAL) + random.uniform(0, JITTER)
+        log.info("Sleeping %.0fs (%s cadence).", sleep_for, "slow" if slow else "fast")
         time.sleep(sleep_for)
 
 
