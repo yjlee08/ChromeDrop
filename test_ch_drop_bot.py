@@ -204,13 +204,35 @@ def test_backoff_retries_requests_then_recovers(monkeypatch):
     assert html == CATEGORY_HTML
 
 
-def test_backoff_last_resort_playwright_on_persistent_empty(monkeypatch):
-    """When requests never yields products, fall back to Playwright once."""
+def test_backoff_no_browser_on_persistent_empty_by_default(monkeypatch):
+    """
+    A page that only *parses empty* (not a hard block) must NOT launch Chromium
+    every sweep — that was the source of the server-Mac heat. Default behavior
+    returns the empty result and retries next sweep.
+    """
+    monkeypatch.setattr(ch_drop_bot, "fetch_via_requests",
+                        lambda url, session=None: (200, "<html>empty</html>"))
+    monkeypatch.setattr(ch_drop_bot.time, "sleep", lambda s: None)
+    monkeypatch.setattr(ch_drop_bot, "FETCH_STRATEGY", "auto")
+    monkeypatch.setattr(ch_drop_bot, "PLAYWRIGHT_ON_EMPTY", False)
+    monkeypatch.setattr(ch_drop_bot, "MAX_FETCH_RETRIES", 2)
+
+    def boom(url, timeout_ms=30_000):
+        raise AssertionError("Playwright must not launch on a mere empty parse")
+
+    monkeypatch.setattr(ch_drop_bot, "fetch_via_playwright", boom)
+    html = ch_drop_bot.fetch_with_backoff("https://x/socks")
+    assert "empty" in html  # returns the requests body, no browser
+
+
+def test_backoff_last_resort_playwright_when_opted_in(monkeypatch):
+    """With PLAYWRIGHT_ON_EMPTY on, persistent empty still falls back once."""
     calls = {"pw": 0}
     monkeypatch.setattr(ch_drop_bot, "fetch_via_requests",
                         lambda url, session=None: (200, "<html>empty</html>"))
     monkeypatch.setattr(ch_drop_bot.time, "sleep", lambda s: None)
     monkeypatch.setattr(ch_drop_bot, "FETCH_STRATEGY", "auto")
+    monkeypatch.setattr(ch_drop_bot, "PLAYWRIGHT_ON_EMPTY", True)
     monkeypatch.setattr(ch_drop_bot, "MAX_FETCH_RETRIES", 2)
 
     def fake_pw(url, timeout_ms=30_000):

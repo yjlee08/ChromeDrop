@@ -74,6 +74,15 @@ CHAT_ID = os.getenv("CHAT_ID", "")
 # Fetch strategy: auto | requests | playwright
 FETCH_STRATEGY = os.getenv("FETCH_STRATEGY", "auto").strip().lower()
 
+# In `auto`, Playwright's real job is rescuing a HARD block (403/challenge).
+# When true, it *also* fires when a page merely parses to zero products. That's
+# off by default: on this site an empty parse is usually transient throttling
+# that a plain requests retry recovers, and launching Chromium every sweep just
+# burns CPU/heat for no gain. Turn on only if a category is genuinely JS-only.
+PLAYWRIGHT_ON_EMPTY = os.getenv("PLAYWRIGHT_ON_EMPTY", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
 # Chrome Hearts is category-based (no single "all products" page). We try to
 # discover categories from the top nav each sweep; this is the fallback list
 # used when discovery fails or is disabled.
@@ -514,8 +523,10 @@ def fetch_with_backoff(url: str, session=None) -> str | None:
     Fetch one URL, retrying transient empty results with exponential backoff.
 
     Order for `auto`: keep retrying plain requests (which is what actually works
-    on this site); if every attempt still parses to zero products, make ONE
-    last-resort Playwright attempt before giving up.
+    on this site). A genuine 403/challenge is escalated to Playwright inside
+    fetch_html. A page that is merely empty is NOT — that's usually transient
+    throttling, and launching Chromium for it every sweep just burns CPU/heat
+    (enable PLAYWRIGHT_ON_EMPTY to force a last-resort browser attempt).
     """
     last_html = None
     for attempt in range(1, MAX_FETCH_RETRIES + 1):
@@ -532,15 +543,16 @@ def fetch_with_backoff(url: str, session=None) -> str | None:
                         attempt, MAX_FETCH_RETRIES, url, delay)
             time.sleep(delay)
 
-    # Persistent empty in auto mode: the page may be genuinely JS-rendered.
-    if FETCH_STRATEGY == "auto":
+    # Persistent empty: only spin up a browser if explicitly opted in.
+    if FETCH_STRATEGY == "auto" and PLAYWRIGHT_ON_EMPTY:
         log.info("requests never parsed products for %s — last-resort Playwright", url)
         pw = _try_playwright(url)
         if pw and parse_products(pw):
             return pw
         last_html = pw or last_html
 
-    log.error("Giving up on %s after %d attempts", url, MAX_FETCH_RETRIES)
+    log.info("Giving up on %s after %d attempts (parsed 0; will retry next sweep).",
+             url, MAX_FETCH_RETRIES)
     return last_html
 
 
