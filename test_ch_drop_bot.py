@@ -381,11 +381,16 @@ def test_category_of():
     assert ch_drop_bot.category_of(f"{BASE}/scents/22-edp/2.html") == "scents"
 
 
-def _run_check_once(monkeypatch, seen, current, sent):
+def _run_check_once(monkeypatch, seen, current, sent, send_ok=True):
     """Drive check_once with a fixed `current` sweep and capture Telegram sends."""
     monkeypatch.setattr(ch_drop_bot, "get_current_products", lambda session=None: current)
     monkeypatch.setattr(ch_drop_bot, "save_seen", lambda s: None)
-    monkeypatch.setattr(ch_drop_bot, "send_batch", lambda hits: sent.extend(hits))
+
+    def fake_send(hits):
+        sent.extend(hits)
+        return send_ok
+
+    monkeypatch.setattr(ch_drop_bot, "send_batch", fake_send)
     return ch_drop_bot.check_once(seen)
 
 
@@ -439,6 +444,68 @@ def test_restock_in_seeded_category_alerts(monkeypatch):
     _run_check_once(monkeypatch, seen, current, sent)
     assert len(sent) == 1
     assert sent[0][2] == "RESTOCK"
+
+
+def test_failed_send_does_not_record_alert(monkeypatch):
+    """Gap #1: a failed Telegram send must NOT mark the item seen (so it retries)."""
+    seen = {f"{BASE}/socks/a/1.html": {"title": "A", "price": "$1", "available": True}}
+    new_url = f"{BASE}/socks/new/3.html"
+    current = {
+        f"{BASE}/socks/a/1.html": {"title": "A", "price": "$1", "available": True},
+        new_url: {"title": "New Drop", "price": "$3", "available": True},
+    }
+    sent = []
+    result = _run_check_once(monkeypatch, seen, current, sent, send_ok=False)
+    assert len(sent) == 1                 # send was attempted
+    assert new_url not in result          # but NOT recorded -> will re-fire
+
+
+def test_failed_then_successful_send_refires_and_records(monkeypatch):
+    """After a failed send, the next sweep re-alerts and (on success) records it."""
+    new_url = f"{BASE}/socks/new/3.html"
+    seen = {f"{BASE}/socks/a/1.html": {"title": "A", "price": "$1", "available": True}}
+    current = {
+        f"{BASE}/socks/a/1.html": {"title": "A", "price": "$1", "available": True},
+        new_url: {"title": "New Drop", "price": "$3", "available": True},
+    }
+    # Sweep 1: send fails -> not recorded.
+    sent1 = []
+    seen = _run_check_once(monkeypatch, seen, current, sent1, send_ok=False)
+    assert new_url not in seen
+    # Sweep 2: send succeeds -> alert re-fires and is now recorded.
+    sent2 = []
+    seen = _run_check_once(monkeypatch, seen, current, sent2, send_ok=True)
+    assert len(sent2) == 1 and sent2[0][2] == "NEW"
+    assert new_url in seen
+    # Sweep 3: already recorded -> no duplicate alert.
+    sent3 = []
+    seen = _run_check_once(monkeypatch, seen, current, sent3, send_ok=True)
+    assert sent3 == []
+
+
+def test_send_batch_returns_false_when_a_message_fails(monkeypatch):
+    monkeypatch.setattr(ch_drop_bot, "TELEGRAM_SEND_RETRIES", 1)
+    monkeypatch.setattr(ch_drop_bot.time, "sleep", lambda s: None)
+    monkeypatch.setattr(ch_drop_bot, "_post_telegram", lambda text: False)
+    hit = (f"{BASE}/socks/a/1.html",
+           {"title": "A", "price": "$1", "available": True}, "NEW")
+    assert ch_drop_bot.send_batch([hit]) is False
+
+
+def test_send_batch_retries_then_succeeds(monkeypatch):
+    attempts = {"n": 0}
+    monkeypatch.setattr(ch_drop_bot, "TELEGRAM_SEND_RETRIES", 3)
+    monkeypatch.setattr(ch_drop_bot.time, "sleep", lambda s: None)
+
+    def flaky(text):
+        attempts["n"] += 1
+        return attempts["n"] >= 2  # fail once, then succeed
+
+    monkeypatch.setattr(ch_drop_bot, "_post_telegram", flaky)
+    hit = (f"{BASE}/socks/a/1.html",
+           {"title": "A", "price": "$1", "available": True}, "NEW")
+    assert ch_drop_bot.send_batch([hit]) is True
+    assert attempts["n"] == 2
 
 
 def test_handle_command_status():

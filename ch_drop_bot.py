@@ -144,6 +144,8 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 TELEGRAM_MAX_ITEMS_PER_MSG = _env_int("TELEGRAM_MAX_ITEMS_PER_MSG", 10)
 TELEGRAM_SEND_DELAY = float(os.getenv("TELEGRAM_SEND_DELAY", "1.2"))
 TELEGRAM_MAX_MSG_CHARS = 3800  # stay under Telegram's 4096 hard limit
+TELEGRAM_SEND_RETRIES = _env_int("TELEGRAM_SEND_RETRIES", 3)  # per-message retries
+TELEGRAM_RETRY_DELAY = float(os.getenv("TELEGRAM_RETRY_DELAY", "3"))  # sec, grows
 
 # Markers that indicate an Akamai / JS bot-challenge interstitial rather than a
 # real category page.
@@ -258,13 +260,32 @@ def _chunk_hits(hits: list[tuple]) -> list[str]:
     return messages
 
 
-def send_batch(hits: list[tuple]) -> None:
-    """Batch hits into as few messages as possible and throttle sends."""
+def _post_telegram_with_retry(text: str) -> bool:
+    """Send one message, retrying a few times so a transient hiccup is survived."""
+    for attempt in range(1, TELEGRAM_SEND_RETRIES + 1):
+        if _post_telegram(text):
+            return True
+        if attempt < TELEGRAM_SEND_RETRIES:
+            time.sleep(TELEGRAM_RETRY_DELAY * attempt)
+    return False
+
+
+def send_batch(hits: list[tuple]) -> bool:
+    """
+    Batch hits into as few messages as possible, throttle, and retry sends.
+
+    Returns True only if every message was delivered. The caller uses this to
+    decide whether to mark the hits as seen — a failed send must NOT be recorded,
+    so the alert re-fires next sweep instead of being lost.
+    """
     messages = _chunk_hits(hits)
+    all_ok = True
     for i, msg in enumerate(messages):
-        _post_telegram(msg)
+        if not _post_telegram_with_retry(msg):
+            all_ok = False
         if i + 1 < len(messages):
             time.sleep(TELEGRAM_SEND_DELAY)
+    return all_ok
 
 
 # ------------------------- COMMANDS -------------------------
@@ -682,26 +703,36 @@ def check_once(seen: dict, session=None) -> dict:
         category_known = category_of(url) in seeded_categories
 
         if is_new and not category_known:
-            seeded_now += 1  # first sighting of this category -> seed, don't alert
+            seeded_now += 1        # first sighting of this category -> seed, no alert
+            seen[url] = prod
         elif (is_new or restocked) and prod["available"] and passes_keywords(prod["title"]):
+            # An alert: DON'T record it yet. Only mark it seen once the Telegram
+            # message is confirmed sent, so a failed send re-fires next sweep
+            # instead of being silently lost.
             hits.append((url, prod, "NEW" if is_new else "RESTOCK"))
-        seen[url] = prod
+        else:
+            seen[url] = prod       # unchanged / sold-out / filtered -> record now
 
     save_seen(seen)
-
-    global _LAST_SWEEP_AT, _TRACKED_COUNT
-    _LAST_SWEEP_AT = time.time()
-    _TRACKED_COUNT = len(seen)
 
     if seeded_now:
         log.info("Seeded %d products from new categories (silent).", seeded_now)
 
     if hits:
-        send_batch(hits)
-        for url, prod, kind in hits:
-            log.info("Alerted: %s %s", kind, prod["title"])
+        if send_batch(hits):
+            for url, prod, kind in hits:
+                seen[url] = prod   # confirmed delivered -> now safe to record
+                log.info("Alerted: %s %s", kind, prod["title"])
+            save_seen(seen)
+        else:
+            log.warning("%d alert(s) failed to send; not recording them — "
+                        "they will re-fire next sweep.", len(hits))
     elif not seeded_now:
         log.info("No changes (%d products live).", len(current))
+
+    global _LAST_SWEEP_AT, _TRACKED_COUNT
+    _LAST_SWEEP_AT = time.time()
+    _TRACKED_COUNT = len(seen)
     return seen
 
 
