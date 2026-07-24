@@ -686,8 +686,12 @@ def watched_categories(session=None) -> list[str]:
         return list(STORE_URLS)
 
     now = time.time()
+    # Re-scan the nav every sweep during fast (drop) hours so a brand-new
+    # category — e.g. a fresh "clothing" drop — is caught within a sweep. During
+    # the slow window nothing drops, so reuse the cached list to save fetches.
+    ttl = DISCOVERY_TTL if within_slow_window() else 0
     if (_discovery_cache["urls"] is not None
-            and now - _discovery_cache["at"] < DISCOVERY_TTL):
+            and now - _discovery_cache["at"] < ttl):
         return list(_discovery_cache["urls"])
 
     home = fetch_html(BASE, session=session)
@@ -698,8 +702,10 @@ def watched_categories(session=None) -> list[str]:
             merged = list(dict.fromkeys(found + list(STORE_URLS)))
             _discovery_cache["at"] = now
             _discovery_cache["urls"] = merged
-            log.info("Discovered %d categories from nav (%d fallback); reusing for %ds",
-                     len(found), len(STORE_URLS), DISCOVERY_TTL)
+            if merged != _discovery_cache.get("last_logged"):
+                log.info("Discovered %d categories from nav (%d fallback).",
+                         len(found), len(STORE_URLS))
+                _discovery_cache["last_logged"] = merged
             return merged
 
     # Discovery failed this time: reuse the last good list if we have one.
