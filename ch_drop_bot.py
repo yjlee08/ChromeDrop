@@ -115,6 +115,9 @@ JITTER = _env_int("JITTER", 30)                    # random 0..JITTER extra sec/
 PER_URL_DELAY = _env_int("PER_URL_DELAY", 3)       # politeness pause between pages
 MAX_FETCH_RETRIES = _env_int("MAX_FETCH_RETRIES", 4)  # per-URL retry attempts
 BACKOFF_BASE = _env_int("BACKOFF_BASE", 2)         # exponential backoff base (sec)
+# Safety valve: if a single sweep would alert more than this many items (e.g. a
+# big category first becoming reachable), send one summary instead of flooding.
+MAX_ALERTS_PER_SWEEP = _env_int("MAX_ALERTS_PER_SWEEP", 25)
 
 # Variable cadence: the store doesn't drop during SLOW_HOURS, so poll less often
 # then (SLOW_INTERVAL); the rest of the day — including the ~6am KST drop — uses
@@ -473,6 +476,38 @@ def parse_cached(url: str, html: str) -> dict:
     return parsed
 
 
+# Matches a product-detail path anywhere in raw HTML (anchors, <link>, meta,
+# JSON) — used to recover products from JS-rendered category pages.
+_HTML_URL_RE = re.compile(
+    r"(?:https://www\.chromehearts\.com)?"
+    r"(/[A-Za-z0-9._-]+/[A-Za-z0-9._%-]+/[A-Za-z0-9._-]+\.html)"
+)
+
+
+def extract_product_urls(html: str, slug: str = None) -> list:
+    """
+    Recover product URLs from raw HTML metadata for JS-rendered category pages
+    (e.g. /eyewear) that expose no <a> product tiles. Restricted to the given
+    category slug to avoid cross-category noise. Returns absolute URLs.
+    """
+    out = {}
+    for m in _HTML_URL_RE.finditer(html or ""):
+        path = m.group(1)
+        if not PRODUCT_RE.match(path):
+            continue
+        if slug and path.strip("/").split("/")[0] != slug:
+            continue
+        out[BASE + path] = None
+    return list(out)
+
+
+def _title_from_url(url: str) -> str:
+    """Human title from a product URL's handle, e.g. .../hollyweird/..  -> Hollyweird."""
+    parts = url.rstrip("/").split("/")
+    handle = parts[-2] if len(parts) >= 2 else parts[-1]
+    return handle.replace("-", " ").strip().title() or "New item"
+
+
 def discover_categories(html: str) -> list[str]:
     """
     Enumerate category URLs from a homepage's top nav.
@@ -687,6 +722,14 @@ def get_current_products(session=None) -> dict:
     for url in urls:
         html = fetch_with_backoff(url, session=session)
         found = parse_cached(url, html) if html else {}
+        if not found and html:
+            # JS-rendered category (no <a> tiles): recover URLs from metadata.
+            extra = extract_product_urls(html, category_of(url))
+            if extra:
+                found = {u: {"title": _title_from_url(u), "price": None,
+                             "available": True} for u in extra}
+                log.info("Recovered %d product URL(s) from metadata for %s "
+                         "(JS-rendered).", len(found), url)
         if not found:
             log.info("0 products parsed from %s (will retry next sweep).", url)
         combined.update(found)
@@ -745,12 +788,11 @@ def check_once(seen: dict, session=None) -> dict:
         log.warning("No products fetched this sweep; keeping previous state.")
         return seen
 
-    # Categories we've already recorded. A category appearing for the FIRST time
-    # (initial run, or one that was throttled to empty on earlier sweeps) is
-    # seeded silently — otherwise its whole existing catalog would fire as false
-    # "NEW" alerts. Genuine NEW/RESTOCK detection kicks in once a category is
-    # seeded. State only ever accumulates, so a later transient empty is safe.
-    seeded_categories = {category_of(u) for u in seen}
+    # Only the very first run (empty state) seeds silently. After that, a new
+    # product — even in a brand-new category like a fresh /eyewear drop — is a
+    # real alert. State only ever accumulates, so items already seen never
+    # re-alert, and a transient empty sweep can't wipe anything.
+    first_run = len(seen) == 0
 
     hits = []
     seeded_now = 0
@@ -758,25 +800,31 @@ def check_once(seen: dict, session=None) -> dict:
         was = seen.get(url)
         is_new = was is None
         restocked = was is not None and not was.get("available") and prod["available"]
-        category_known = category_of(url) in seeded_categories
-
-        if is_new and not category_known:
-            seeded_now += 1        # first sighting of this category -> seed, no alert
+        if first_run:
             seen[url] = prod
+            seeded_now += 1
         elif (is_new or restocked) and prod["available"] and passes_keywords(prod["title"]):
             # An alert: DON'T record it yet. Only mark it seen once the Telegram
-            # message is confirmed sent, so a failed send re-fires next sweep
-            # instead of being silently lost.
+            # message is confirmed sent, so a failed send re-fires next sweep.
             hits.append((url, prod, "NEW" if is_new else "RESTOCK"))
         else:
             seen[url] = prod       # unchanged / sold-out / filtered -> record now
 
     save_seen(seen)
 
-    if seeded_now:
-        log.info("Seeded %d products from new categories (silent).", seeded_now)
-
-    if hits:
+    if first_run:
+        log.info("Seeded %d products (first run, silent).", seeded_now)
+    elif len(hits) > MAX_ALERTS_PER_SWEEP:
+        # Safety valve: unusually large batch -> one summary, not a flood.
+        log.warning("%d new items this sweep exceeds cap %d — sending summary.",
+                    len(hits), MAX_ALERTS_PER_SWEEP)
+        if _post_telegram_with_retry(
+                f"🆕 <b>{len(hits)} new items</b> just appeared on Chrome Hearts "
+                "— open the store to see them."):
+            for url, prod, _kind in hits:
+                seen[url] = prod
+            save_seen(seen)
+    elif hits:
         if send_batch(hits):
             for url, prod, kind in hits:
                 seen[url] = prod   # confirmed delivered -> now safe to record
@@ -785,7 +833,7 @@ def check_once(seen: dict, session=None) -> dict:
         else:
             log.warning("%d alert(s) failed to send; not recording them — "
                         "they will re-fire next sweep.", len(hits))
-    elif not seeded_now:
+    else:
         log.info("No changes (%d products live).", len(current))
 
     global _LAST_SWEEP_AT, _TRACKED_COUNT

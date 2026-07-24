@@ -116,6 +116,27 @@ def test_empty_page_yields_no_products():
     assert parse_products("<html><body>nothing here</body></html>") == {}
 
 
+def test_extract_product_urls_from_metadata():
+    """Recover a product URL that only appears in a <link>/meta (JS-rendered)."""
+    html = (
+        '<link rel="alternate" hreflang="x-default" '
+        'href="https://www.chromehearts.com/eyewear/hollyweird/21761920SE5101X.html" />'
+        '<meta property="og:url" content="https://www.chromehearts.com/eyewear/hollyweird/21761920SE5101X.html" />'
+        '<a href="/socks/other/1.html">noise from another category</a>'
+    )
+    found = ch_drop_bot.extract_product_urls(html, "eyewear")
+    assert found == [f"{BASE}/eyewear/hollyweird/21761920SE5101X.html"]
+    # Slug filter keeps out cross-category noise.
+    assert all("eyewear" in u for u in found)
+
+
+def test_title_from_url():
+    assert ch_drop_bot._title_from_url(
+        f"{BASE}/eyewear/hollyweird/21761920SE5101X.html") == "Hollyweird"
+    assert ch_drop_bot._title_from_url(
+        f"{BASE}/boxers-leggings/boxer-brief---long/1.html") == "Boxer Brief   Long"
+
+
 def test_parse_cached_matches_parse_products_and_reuses(monkeypatch):
     """parse_cached must equal parse_products, and skip re-parsing identical HTML."""
     ch_drop_bot._page_cache.clear()
@@ -406,20 +427,41 @@ def test_first_run_seeds_silently(monkeypatch):
     assert set(seen) == set(current)
 
 
-def test_new_category_appearing_later_seeds_silently(monkeypatch):
+def test_new_category_appearing_later_alerts(monkeypatch):
     """
-    A category first seen on a LATER sweep (e.g. scents was throttled during the
-    initial seed) must seed silently, not flood 21 false NEW alerts.
+    A brand-new category dropping after startup (e.g. a fresh /eyewear) must
+    ALERT — that's the whole point. (Only the very first run seeds silently.)
     """
     seen = {f"{BASE}/socks/a/1.html": {"title": "A", "price": "$1", "available": True}}
     current = {
         f"{BASE}/socks/a/1.html": {"title": "A", "price": "$1", "available": True},
-        f"{BASE}/scents/x/9.html": {"title": "Scent X", "price": "$9", "available": True},
-        f"{BASE}/scents/y/8.html": {"title": "Scent Y", "price": "$8", "available": True},
+        f"{BASE}/eyewear/hollyweird/9.html": {"title": "Hollyweird", "price": None, "available": True},
     }
     sent = []
     _run_check_once(monkeypatch, seen, current, sent)
-    assert sent == []  # scents is a brand-new category -> silent seed
+    assert len(sent) == 1
+    assert sent[0][2] == "NEW"
+    assert "eyewear" in sent[0][0]
+
+
+def test_flood_cap_sends_summary(monkeypatch):
+    """A huge batch is summarized (one message), not flooded, and all recorded."""
+    seen = {f"{BASE}/socks/a/1.html": {"title": "A", "price": "$1", "available": True}}
+    current = dict(seen)
+    for i in range(40):
+        current[f"{BASE}/eyewear/item-{i}/{i}.html"] = {
+            "title": f"E{i}", "price": None, "available": True}
+    posted = []
+    monkeypatch.setattr(ch_drop_bot, "MAX_ALERTS_PER_SWEEP", 25)
+    monkeypatch.setattr(ch_drop_bot, "save_seen", lambda s: None)
+    monkeypatch.setattr(ch_drop_bot, "get_current_products", lambda session=None: current)
+    monkeypatch.setattr(ch_drop_bot, "send_batch",
+                        lambda hits: (_ for _ in ()).throw(AssertionError("should summarize")))
+    monkeypatch.setattr(ch_drop_bot, "_post_telegram_with_retry",
+                        lambda text: posted.append(text) or True)
+    result = ch_drop_bot.check_once(seen)
+    assert len(posted) == 1 and "new items" in posted[0]
+    assert f"{BASE}/eyewear/item-0/0.html" in result  # all recorded, won't re-fire
 
 
 def test_new_product_in_seeded_category_alerts(monkeypatch):
